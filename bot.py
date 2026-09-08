@@ -26,16 +26,100 @@ PORT = int(os.environ.get("PORT", 10000))
 
 DB_PATH = "bot.db"
 
-# ---------- MAHSULOTLAR RO'YXATI — o'zingiznikiga moslab o'zgartiring ----------
+# ---------- XIZMATLAR RO'YXATI ----------
+# "tiers": [(chegara, narx), ...] — miqdor shu chegaradan kichik yoki teng bo'lsa shu narx qo'llanadi.
+# Oxirgi qatorda chegara "None" bo'lishi kerak — bu "shundan yuqori miqdor" degani.
+# Agar narx miqdordan qat'iy nazar bir xil bo'lsa, faqat bitta qator yozing: [(None, narx)]
 PRODUCTS = [
-    {"id": 1, "name": "Mahsulot 1", "price": 150000},
-    {"id": 2, "name": "Mahsulot 2", "price": 220000},
-    {"id": 3, "name": "Mahsulot 3", "price": 90000},
+    {
+        "id": 1,
+        "name": "Rangsiz chiqarish",
+        "category": "Fayl pechat qilish",
+        "unit": "varoq",
+        "tiers": [(100, 500), (None, 300)],
+    },
+    {
+        "id": 2,
+        "name": "Rangli chiqarish (oddiy qog'oz)",
+        "category": "Fayl pechat qilish",
+        "unit": "varoq",
+        "tiers": [(99, 1000), (None, 500)],
+    },
+    {
+        "id": 3,
+        "name": "Glyansiy qog'ozga chiqarish",
+        "category": "Fayl pechat qilish",
+        "unit": "varoq",
+        "tiers": [(99, 2000), (None, 1500)],
+    },
+    {
+        "id": 4,
+        "name": "Kitob shaklida chiqarish (A5)",
+        "category": "Fayl pechat qilish",
+        "unit": "bet",
+        "tiers": [(None, 100)],
+    },
+    {
+        "id": 5,
+        "name": "Referat / Mustaqil ishi tayyorlash",
+        "category": "Referat / Mustaqil ishi tayyorlash",
+        "unit": "bet",
+        "tiers": [(None, 1000)],
+    },
+    {
+        "id": 6,
+        "name": "Kurs ishi tayyorlash",
+        "category": "Referat / Mustaqil ishi tayyorlash",
+        "unit": "bet",
+        "tiers": [(None, 1000)],
+    },
+    {
+        "id": 7,
+        "name": "Taqdimot tayyorlash — rangli pechat bilan",
+        "category": "Taqdimot tayyorlash",
+        "unit": "bet",
+        "tiers": [(None, 1500)],
+    },
+    {
+        "id": 8,
+        "name": "Taqdimot tayyorlash — rangsiz pechat bilan",
+        "category": "Taqdimot tayyorlash",
+        "unit": "bet",
+        "tiers": [(None, 1000)],
+    },
+    {
+        "id": 9,
+        "name": "Taqdimot tayyorlash — faqat fayl (pechatsiz)",
+        "category": "Taqdimot tayyorlash",
+        "unit": "dona",
+        "tiers": [(None, 10000)],
+    },
 ]
+
+PRODUCTS_BY_ID = {p["id"]: p for p in PRODUCTS}
+
+
+def get_categories() -> list[str]:
+    seen: list[str] = []
+    for p in PRODUCTS:
+        if p["category"] not in seen:
+            seen.append(p["category"])
+    return seen
 
 
 def fmt_price(value: int) -> str:
     return f"{value:,}".replace(",", " ") + " so'm"
+
+
+def get_unit_price(product: dict, qty: int) -> int:
+    for max_q, price in product["tiers"]:
+        if max_q is None or qty <= max_q:
+            return price
+    return product["tiers"][-1][1]
+
+
+def calc_subtotal(product: dict, qty: int) -> int:
+    return get_unit_price(product, qty) * qty
 
 
 # ---------- Baza ----------
@@ -120,17 +204,28 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Foydalanuvchi savati vaqtinchalik xotirada saqlanadi (oddiy loyiha uchun yetarli)
+# Foydalanuvchi savati: {telegram_id: {product_id: qty}}
 carts: dict[int, dict[int, int]] = {}
+# Miqdor kiritilishini kutayotgan foydalanuvchilar: {telegram_id: product_id}
+awaiting_qty: dict[int, int] = {}
 
 
-def catalog_keyboard(price_visible: bool) -> InlineKeyboardMarkup:
+def catalog_keyboard() -> InlineKeyboardMarkup:
+    kb = []
+    for idx, category in enumerate(get_categories()):
+        kb.append([InlineKeyboardButton(text=category, callback_data=f"cat:{idx}")])
+    kb.append([InlineKeyboardButton(text="🛒 Savatni ko'rish", callback_data="cart")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def items_keyboard(cat_idx: int) -> InlineKeyboardMarkup:
+    category = get_categories()[cat_idx]
     kb = []
     for p in PRODUCTS:
-        label = p["name"]
-        if price_visible:
-            label += f" — {fmt_price(p['price'])}"
-        kb.append([InlineKeyboardButton(text=label, callback_data=f"add:{p['id']}")])
+        if p["category"] != category:
+            continue
+        kb.append([InlineKeyboardButton(text=p["name"], callback_data=f"add:{p['id']}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="back")])
     kb.append([InlineKeyboardButton(text="🛒 Savatni ko'rish", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -138,25 +233,70 @@ def catalog_keyboard(price_visible: bool) -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def start_handler(message: Message, command: CommandObject):
     source_param = command.args  # masalan: ads_instagram
-    user = get_or_create_user(
+    get_or_create_user(
         message.from_user.id,
         message.from_user.full_name,
         message.from_user.username,
         source_param,
     )
     carts[message.from_user.id] = {}
+    awaiting_qty.pop(message.from_user.id, None)
     await message.answer(
-        "Assalomu alaykum! Buyurtma berish uchun mahsulotni tanlang:",
-        reply_markup=catalog_keyboard(bool(user["price_visible"])),
+        "Assalomu alaykum! Kerakli bo'limni tanlang:",
+        reply_markup=catalog_keyboard(),
     )
 
 
+@router.callback_query(F.data.startswith("cat:"))
+async def show_category(callback: CallbackQuery):
+    cat_idx = int(callback.data.split(":")[1])
+    await callback.message.answer("Xizmatni tanlang:", reply_markup=items_keyboard(cat_idx))
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("add:"))
-async def add_to_cart(callback: CallbackQuery):
+async def ask_quantity(callback: CallbackQuery):
     product_id = int(callback.data.split(":")[1])
-    cart = carts.setdefault(callback.from_user.id, {})
-    cart[product_id] = cart.get(product_id, 0) + 1
-    await callback.answer("Qo'shildi ✅")
+    product = PRODUCTS_BY_ID[product_id]
+    awaiting_qty[callback.from_user.id] = product_id
+    await callback.message.answer(
+        f"«{product['name']}» — necha {product['unit']} kerak? Raqamda yozing (masalan: 20):"
+    )
+    await callback.answer()
+
+
+@router.message(F.text.regexp(r"^\d+$"))
+async def receive_quantity(message: Message):
+    telegram_id = message.from_user.id
+    if telegram_id not in awaiting_qty:
+        return  # oddiy raqamli xabar, biz kutmayotgan holat
+
+    qty = int(message.text)
+    if qty <= 0:
+        await message.answer("Miqdor 0 dan katta bo'lishi kerak. Qaytadan yozing:")
+        return
+
+    product_id = awaiting_qty.pop(telegram_id)
+    product = PRODUCTS_BY_ID[product_id]
+
+    cart = carts.setdefault(telegram_id, {})
+    cart[product_id] = cart.get(product_id, 0) + qty
+
+    total_qty = cart[product_id]
+    subtotal = calc_subtotal(product, total_qty)
+
+    user = get_user(telegram_id)
+    price_visible = bool(user["price_visible"])
+
+    if price_visible:
+        text = (
+            f"✅ Qo'shildi: {product['name']} — {qty} {product['unit']}\n"
+            f"Savatingizda jami: {total_qty} {product['unit']} — {fmt_price(subtotal)}"
+        )
+    else:
+        text = f"✅ Qo'shildi: {product['name']} — {qty} {product['unit']}"
+
+    await message.answer(text, reply_markup=catalog_keyboard())
 
 
 @router.callback_query(F.data == "cart")
@@ -174,13 +314,13 @@ async def show_cart(callback: CallbackQuery):
     lines = []
     total = 0
     for pid, qty in cart.items():
-        product = next(p for p in PRODUCTS if p["id"] == pid)
-        subtotal = product["price"] * qty
+        product = PRODUCTS_BY_ID[pid]
+        subtotal = calc_subtotal(product, qty)
         total += subtotal
         if price_visible:
-            lines.append(f"{product['name']} x{qty} — {fmt_price(subtotal)}")
+            lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
         else:
-            lines.append(f"{product['name']} x{qty}")
+            lines.append(f"{product['name']} — {qty} {product['unit']}")
 
     text = "🛒 Sizning buyurtmangiz:\n" + "\n".join(lines)
     if price_visible:
@@ -189,7 +329,7 @@ async def show_cart(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Buyurtmani tasdiqlash", callback_data="confirm")],
-            [InlineKeyboardButton(text="⬅️ Katalogga qaytish", callback_data="back")],
+            [InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="back")],
         ]
     )
     await callback.message.answer(text, reply_markup=kb)
@@ -198,8 +338,7 @@ async def show_cart(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back")
 async def back_to_catalog(callback: CallbackQuery):
-    user = get_user(callback.from_user.id)
-    await callback.message.answer("Katalog:", reply_markup=catalog_keyboard(bool(user["price_visible"])))
+    await callback.message.answer("Bo'limlar:", reply_markup=catalog_keyboard())
     await callback.answer()
 
 
@@ -217,10 +356,10 @@ async def confirm_order(callback: CallbackQuery):
     lines = []
     total = 0
     for pid, qty in cart.items():
-        product = next(p for p in PRODUCTS if p["id"] == pid)
-        subtotal = product["price"] * qty
+        product = PRODUCTS_BY_ID[pid]
+        subtotal = calc_subtotal(product, qty)
         total += subtotal
-        lines.append(f"{product['name']} x{qty} — {fmt_price(subtotal)}")
+        lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
 
     items_text = "\n".join(lines)
     save_order(telegram_id, items_text, total)
