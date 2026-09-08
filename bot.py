@@ -24,6 +24,10 @@ WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 PORT = int(os.environ.get("PORT", 10000))
 
+# BOT_MODE: "ads" — bu bot faqat reklama uchun, hamma mijozga narx ko'rinadi.
+#           "direct" (yoki qo'yilmasa) — bu bot kelishilgan mijozlar uchun, narx ko'rinmaydi.
+BOT_MODE = os.environ.get("BOT_MODE", "direct")
+
 DB_PATH = "bot.db"
 
 # ---------- XIZMATLAR VA NARXLAR (faqat reklama mijozlariga ko'rinadi) ----------
@@ -174,11 +178,17 @@ def get_or_create_user(telegram_id: int, name: str, username: str | None, source
     conn = db()
     row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
     if row is None:
-        # Agar start parametri "ads" bilan boshlansa -> reklama mijozi -> "Narxlar" tugmasi ko'rinadi
-        price_visible = 1 if source_param and source_param.startswith("ads") else 0
+        if BOT_MODE == "ads":
+            # Bu — faqat reklama uchun bot, har bir mijozga narx ko'rsatiladi
+            price_visible = 1
+            source = source_param or "ads_direct"
+        else:
+            # Bu — kelishilgan mijozlar uchun bot, narx ko'rsatilmaydi
+            price_visible = 1 if source_param and source_param.startswith("ads") else 0
+            source = source_param or "direct"
         conn.execute(
             "INSERT INTO users (telegram_id, name, username, price_visible, source, created_at) VALUES (?,?,?,?,?,?)",
-            (telegram_id, name, username, price_visible, source_param or "direct", datetime.now().isoformat()),
+            (telegram_id, name, username, price_visible, source, datetime.now().isoformat()),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
