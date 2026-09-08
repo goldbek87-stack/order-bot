@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sqlite3
@@ -230,6 +231,13 @@ def save_relay(admin_msg_id: int, customer_id: int):
     conn.close()
 
 
+def get_all_user_ids() -> list[int]:
+    conn = db()
+    rows = conn.execute("SELECT telegram_id FROM users").fetchall()
+    conn.close()
+    return [row["telegram_id"] for row in rows]
+
+
 def get_relay_customer(admin_msg_id: int) -> int | None:
     conn = db()
     row = conn.execute("SELECT customer_id FROM relay WHERE admin_msg_id=?", (admin_msg_id,)).fetchone()
@@ -248,6 +256,7 @@ carts: dict[int, dict[int, int]] = {}
 awaiting_qty: dict[int, int] = {}
 awaiting_details: set[int] = set()
 awaiting_file: set[int] = set()
+awaiting_broadcast = False
 
 
 def start_keyboard(price_visible: bool) -> InlineKeyboardMarkup | None:
@@ -446,6 +455,28 @@ async def set_price_cmd(message: Message, command: CommandObject):
     await message.answer(f"{target_id} uchun narx ko'rsatish: {value}")
 
 
+@router.message(Command("broadcast"))
+async def broadcast_cmd(message: Message):
+    global awaiting_broadcast
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return
+    awaiting_broadcast = True
+    await message.answer(
+        "📢 Yuboriladigan xabarni yozing (matn, rasm yoki fayl bo'lishi mumkin) — "
+        "keyingi xabaringiz botga murojaat qilgan BARCHA odamlarga jo'natiladi.\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+
+
+@router.message(Command("cancel"))
+async def cancel_cmd(message: Message):
+    global awaiting_broadcast
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return
+    awaiting_broadcast = False
+    await message.answer("Bekor qilindi.")
+
+
 @router.message(F.text.startswith("/"))
 async def ignore_unknown_commands(message: Message):
     return  # tanilmagan buyruqlarni e'tiborsiz qoldiramiz
@@ -461,8 +492,26 @@ async def admin_reply(message: Message):
 
 
 @router.message(F.from_user.id == ADMIN_CHAT_ID)
-async def ignore_admin_own_messages(message: Message):
-    return  # adminning oddiy (reply bo'lmagan) xabarlarini e'tiborsiz qoldiramiz
+async def admin_broadcast_or_ignore(message: Message):
+    global awaiting_broadcast
+    if not awaiting_broadcast:
+        return  # oddiy (reply bo'lmagan) xabar — e'tiborsiz qoldiramiz
+
+    awaiting_broadcast = False
+    user_ids = get_all_user_ids()
+    sent = 0
+    failed = 0
+    for uid in user_ids:
+        if uid == ADMIN_CHAT_ID:
+            continue
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=ADMIN_CHAT_ID, message_id=message.message_id)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await message.answer(f"📢 Yuborildi: {sent} ta foydalanuvchiga. Xato: {failed} ta (bloklangan/o'chirilgan).")
 
 
 @router.message(F.text)
