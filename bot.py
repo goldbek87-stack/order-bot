@@ -19,17 +19,16 @@ logging.basicConfig(level=logging.INFO)
 # ---------- Sozlamalar (Render'da Environment Variables sifatida beriladi) ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
-WEBHOOK_HOST = os.environ["WEBHOOK_HOST"]  # masalan: https://sizning-botingiz.onrender.com
+WEBHOOK_HOST = os.environ["WEBHOOK_HOST"]
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 PORT = int(os.environ.get("PORT", 10000))
 
 DB_PATH = "bot.db"
 
-# ---------- XIZMATLAR RO'YXATI ----------
-# "tiers": [(chegara, narx), ...] — miqdor shu chegaradan kichik yoki teng bo'lsa shu narx qo'llanadi.
-# Oxirgi qatorda chegara "None" bo'lishi kerak — bu "shundan yuqori miqdor" degani.
-# Agar narx miqdordan qat'iy nazar bir xil bo'lsa, faqat bitta qator yozing: [(None, narx)]
+# ---------- XIZMATLAR VA NARXLAR (faqat reklama mijozlariga ko'rinadi) ----------
+# "tiers": [(chegara, narx), ...] — miqdor shu chegaradan kichik/teng bo'lsa shu narx.
+# Oxirgi qatorda chegara "None" bo'lishi kerak. Bitta narx bo'lsa: [(None, narx)]
 PRODUCTS = [
     {
         "id": 1,
@@ -97,6 +96,8 @@ PRODUCTS = [
 ]
 
 PRODUCTS_BY_ID = {p["id"]: p for p in PRODUCTS}
+PRINT_CATEGORY = "Fayl pechat qilish"
+CUSTOM_CATEGORIES = {"Referat / Mustaqil ishi tayyorlash", "Taqdimot tayyorlash"}
 
 
 def get_categories() -> list[str]:
@@ -154,6 +155,17 @@ def init_db():
         )
         """
     )
+    # admin chatidagi xabar ID'sini mijoz ID'siga bog'lab turadi — admin "reply" qilganda
+    # bot qaysi mijozga javob yuborishni shundan biladi.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relay (
+            admin_msg_id INTEGER PRIMARY KEY,
+            customer_id INTEGER,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -162,7 +174,7 @@ def get_or_create_user(telegram_id: int, name: str, username: str | None, source
     conn = db()
     row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
     if row is None:
-        # Agar start parametri "ads" bilan boshlansa -> reklama mijozi -> narx ko'rinadi
+        # Agar start parametri "ads" bilan boshlansa -> reklama mijozi -> "Narxlar" tugmasi ko'rinadi
         price_visible = 1 if source_param and source_param.startswith("ads") else 0
         conn.execute(
             "INSERT INTO users (telegram_id, name, username, price_visible, source, created_at) VALUES (?,?,?,?,?,?)",
@@ -198,32 +210,48 @@ def save_order(telegram_id: int, items_text: str, total: int):
     conn.close()
 
 
+def save_relay(admin_msg_id: int, customer_id: int):
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO relay (admin_msg_id, customer_id, created_at) VALUES (?,?,?)",
+        (admin_msg_id, customer_id, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_relay_customer(admin_msg_id: int) -> int | None:
+    conn = db()
+    row = conn.execute("SELECT customer_id FROM relay WHERE admin_msg_id=?", (admin_msg_id,)).fetchone()
+    conn.close()
+    return row["customer_id"] if row else None
+
+
 # ---------- Bot ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Foydalanuvchi savati: {telegram_id: {product_id: qty}}
+# Faqat "Narxlar" tugmasi orqali kirgan (reklama) mijozlar uchun holatlar:
 carts: dict[int, dict[int, int]] = {}
-# Miqdor kiritilishini kutayotgan foydalanuvchilar: {telegram_id: product_id}
 awaiting_qty: dict[int, int] = {}
-# Fayl (chop etish uchun) kutilayotgan foydalanuvchilar
-awaiting_file: set[int] = set()
-# Mavzu/talablar matni kutilayotgan foydalanuvchilar
 awaiting_details: set[int] = set()
-# Faqat chop etish buyurtmasi uchun muddat kutilayotgan foydalanuvchilar
-awaiting_deadline: set[int] = set()
-
-PRINT_CATEGORY = "Fayl pechat qilish"
-CUSTOM_CATEGORIES = {"Referat / Mustaqil ishi tayyorlash", "Taqdimot tayyorlash"}
+awaiting_file: set[int] = set()
 
 
-def catalog_keyboard() -> InlineKeyboardMarkup:
+def start_keyboard(price_visible: bool) -> InlineKeyboardMarkup | None:
+    if not price_visible:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="💰 Narxlar", callback_data="prices")]]
+    )
+
+
+def categories_keyboard() -> InlineKeyboardMarkup:
     kb = []
     for idx, category in enumerate(get_categories()):
         kb.append([InlineKeyboardButton(text=category, callback_data=f"cat:{idx}")])
-    kb.append([InlineKeyboardButton(text="🛒 Savatni ko'rish", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
@@ -234,26 +262,56 @@ def items_keyboard(cat_idx: int) -> InlineKeyboardMarkup:
         if p["category"] != category:
             continue
         kb.append([InlineKeyboardButton(text=p["name"], callback_data=f"add:{p['id']}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="back")])
+    kb.append([InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="prices")])
     kb.append([InlineKeyboardButton(text="🛒 Savatni ko'rish", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+async def relay_to_admin(message: Message):
+    """Mijozning istalgan xabari/faylini adminga yuboradi. Admin shu xabarga
+    Telegram'ning 'Reply' funksiyasi orqali javob qaytarsa, bot buni avtomatik
+    o'sha mijozga jo'natadi."""
+    customer_id = message.from_user.id
+    user = get_or_create_user(customer_id, message.from_user.full_name, message.from_user.username, None)
+    contact = f"@{user['username']}" if user["username"] else "username yo'q"
+    kind = "Reklama mijozi" if user["price_visible"] else "Kelishilgan mijoz"
+    header = f"👤 {user['name']} ({contact})\nID: {customer_id} | {kind} | Manba: {user['source']}"
+
+    info_msg = await bot.send_message(ADMIN_CHAT_ID, header)
+    forwarded = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=customer_id, message_id=message.message_id)
+
+    save_relay(info_msg.message_id, customer_id)
+    save_relay(forwarded.message_id, customer_id)
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message, command: CommandObject):
     source_param = command.args  # masalan: ads_instagram
-    get_or_create_user(
+    user = get_or_create_user(
         message.from_user.id,
         message.from_user.full_name,
         message.from_user.username,
         source_param,
     )
     carts[message.from_user.id] = {}
-    awaiting_qty.pop(message.from_user.id, None)
+    price_visible = bool(user["price_visible"])
+
     await message.answer(
-        "Assalomu alaykum! Kerakli bo'limni tanlang:",
-        reply_markup=catalog_keyboard(),
+        "Assalomu alaykum! 👋\n\n"
+        "Kerakli faylingizni yoki xabaringizni shu yerga yozing/yuboring — "
+        "biz tez orada siz bilan bog'lanamiz.",
+        reply_markup=start_keyboard(price_visible),
     )
+
+
+@router.callback_query(F.data == "prices")
+async def show_prices(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    if not user or not bool(user["price_visible"]):
+        await callback.answer("Bu bo'lim mavjud emas.", show_alert=True)
+        return
+    await callback.message.answer("Kerakli bo'limni tanlang:", reply_markup=categories_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -274,6 +332,94 @@ async def ask_quantity(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "cart")
+async def show_cart(callback: CallbackQuery):
+    telegram_id = callback.from_user.id
+    cart = carts.get(telegram_id, {})
+    if not cart:
+        await callback.message.answer("Savatingiz bo'sh.")
+        await callback.answer()
+        return
+
+    lines = []
+    total = 0
+    for pid, qty in cart.items():
+        product = PRODUCTS_BY_ID[pid]
+        subtotal = calc_subtotal(product, qty)
+        total += subtotal
+        lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
+
+    text = "🛒 Sizning buyurtmangiz:\n" + "\n".join(lines) + f"\n\nJami: {fmt_price(total)}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Buyurtmani tasdiqlash", callback_data="confirm")],
+            [InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="prices")],
+        ]
+    )
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm")
+async def confirm_order(callback: CallbackQuery):
+    telegram_id = callback.from_user.id
+    cart = carts.get(telegram_id, {})
+    if not cart:
+        await callback.answer("Savat bo'sh")
+        return
+
+    user = get_user(telegram_id)
+    contact = f"@{user['username']}" if user["username"] else "username yo'q"
+
+    lines = []
+    total = 0
+    for pid, qty in cart.items():
+        product = PRODUCTS_BY_ID[pid]
+        subtotal = calc_subtotal(product, qty)
+        total += subtotal
+        lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
+
+    items_text = "\n".join(lines)
+    save_order(telegram_id, items_text, total)
+
+    needs_file = any(PRODUCTS_BY_ID[pid]["category"] == PRINT_CATEGORY for pid in cart)
+    needs_details = any(PRODUCTS_BY_ID[pid]["category"] in CUSTOM_CATEGORIES for pid in cart)
+
+    admin_text = (
+        "🆕 Yangi buyurtma (Narxlar orqali)!\n\n"
+        f"Mijoz: {user['name']} ({contact})\n"
+        f"ID: {telegram_id}\n\n"
+        f"{items_text}\n\nJami: {fmt_price(total)}"
+    )
+    admin_msg = await bot.send_message(ADMIN_CHAT_ID, admin_text)
+    save_relay(admin_msg.message_id, telegram_id)
+
+    await callback.message.answer("Buyurtmangiz qabul qilindi! ✅")
+
+    if needs_details:
+        await callback.message.answer(
+            "📝 Iltimos, quyidagi ma'lumotlarni bitta xabarda yozib yuboring:\n\n"
+            "1) Mavzu nomi\n"
+            "2) Til (o'zbek / rus / ingliz)\n"
+            "3) Muddat (qachongacha kerak)\n"
+            "4) Qo'shimcha talablar (agar bo'lsa)"
+        )
+        awaiting_details.add(telegram_id)
+
+    if needs_file:
+        await callback.message.answer(
+            "📎 Endi chop etish uchun kerakli faylingizni (PDF, Word va h.k.) shu yerga yuboring."
+        )
+        awaiting_file.add(telegram_id)
+
+    if not needs_file and not needs_details:
+        await callback.message.answer("Tez orada siz bilan bog'lanamiz.")
+
+    carts[telegram_id] = {}
+    await callback.answer()
+
+
 @router.message(Command("setprice"))
 async def set_price_cmd(message: Message, command: CommandObject):
     if message.from_user.id != ADMIN_CHAT_ID:
@@ -290,15 +436,31 @@ async def set_price_cmd(message: Message, command: CommandObject):
     await message.answer(f"{target_id} uchun narx ko'rsatish: {value}")
 
 
+@router.message(F.text.startswith("/"))
+async def ignore_unknown_commands(message: Message):
+    return  # tanilmagan buyruqlarni e'tiborsiz qoldiramiz
+
+
+@router.message(F.from_user.id == ADMIN_CHAT_ID, F.reply_to_message)
+async def admin_reply(message: Message):
+    customer_id = get_relay_customer(message.reply_to_message.message_id)
+    if customer_id is None:
+        await message.answer("⚠️ Bu xabar mijozga bog'lanmagan — asl xabarga to'g'ridan-to'g'ri reply qiling.")
+        return
+    await bot.copy_message(chat_id=customer_id, from_chat_id=ADMIN_CHAT_ID, message_id=message.message_id)
+
+
+@router.message(F.from_user.id == ADMIN_CHAT_ID)
+async def ignore_admin_own_messages(message: Message):
+    return  # adminning oddiy (reply bo'lmagan) xabarlarini e'tiborsiz qoldiramiz
+
+
 @router.message(F.text)
 async def handle_text(message: Message):
     telegram_id = message.from_user.id
     text = message.text.strip()
 
-    if text.startswith("/"):
-        return  # buyruqlar o'z handlerlarida qayta ishlanadi
-
-    # --- Miqdor kutilayotgan bo'lsa ---
+    # --- Miqdor kutilayotgan bo'lsa (faqat "Narxlar" flow'ida) ---
     if telegram_id in awaiting_qty and text.isdigit():
         qty = int(text)
         if qty <= 0:
@@ -314,182 +476,51 @@ async def handle_text(message: Message):
         total_qty = cart[product_id]
         subtotal = calc_subtotal(product, total_qty)
 
-        user = get_user(telegram_id)
-        price_visible = bool(user["price_visible"])
-
-        if price_visible:
-            reply = (
-                f"✅ Qo'shildi: {product['name']} — {qty} {product['unit']}\n"
-                f"Savatingizda jami: {total_qty} {product['unit']} — {fmt_price(subtotal)}"
-            )
-        else:
-            reply = f"✅ Qo'shildi: {product['name']} — {qty} {product['unit']}"
-
-        await message.answer(reply, reply_markup=catalog_keyboard())
-        return
-
-    # --- Faqat chop etish buyurtmasi uchun muddat kutilayotgan bo'lsa ---
-    if telegram_id in awaiting_deadline:
-        user = get_user(telegram_id)
-        contact = f"@{user['username']}" if user["username"] else "username yo'q"
-        admin_text = f"⏰ Muddat — {user['name']} ({contact}), ID: {telegram_id}\n\n{text}"
-        await bot.send_message(ADMIN_CHAT_ID, admin_text)
-        awaiting_deadline.discard(telegram_id)
-
-        awaiting_file.add(telegram_id)
-        await message.answer(
-            "📎 Endi chop etish uchun kerakli faylingizni (PDF, Word va h.k.) shu yerga yuboring."
+        reply = (
+            f"✅ Qo'shildi: {product['name']} — {qty} {product['unit']}\n"
+            f"Savatingizda jami: {total_qty} {product['unit']} — {fmt_price(subtotal)}"
         )
+        await message.answer(reply, reply_markup=categories_keyboard())
         return
 
     # --- Mavzu/talablar matni kutilayotgan bo'lsa ---
     if telegram_id in awaiting_details:
         user = get_user(telegram_id)
         contact = f"@{user['username']}" if user["username"] else "username yo'q"
-        admin_text = (
-            f"📝 Mavzu/talablar — {user['name']} ({contact}), ID: {telegram_id}\n\n{text}"
-        )
+        admin_text = f"📝 Mavzu/talablar — {user['name']} ({contact}), ID: {telegram_id}\n\n{text}"
         await bot.send_message(ADMIN_CHAT_ID, admin_text)
         awaiting_details.discard(telegram_id)
         await message.answer("Ma'lumot qabul qilindi ✅ Tez orada siz bilan bog'lanamiz.")
         return
 
-    # Boshqa hollarda e'tiborsiz qoldiramiz (masalan tasodifiy raqamli xabar)
-
-
-@router.callback_query(F.data == "cart")
-async def show_cart(callback: CallbackQuery):
-    telegram_id = callback.from_user.id
-    cart = carts.get(telegram_id, {})
-    if not cart:
-        await callback.message.answer("Savatingiz bo'sh.")
-        await callback.answer()
-        return
-
-    user = get_user(telegram_id)
-    price_visible = bool(user["price_visible"])
-
-    lines = []
-    total = 0
-    for pid, qty in cart.items():
-        product = PRODUCTS_BY_ID[pid]
-        subtotal = calc_subtotal(product, qty)
-        total += subtotal
-        if price_visible:
-            lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
-        else:
-            lines.append(f"{product['name']} — {qty} {product['unit']}")
-
-    text = "🛒 Sizning buyurtmangiz:\n" + "\n".join(lines)
-    if price_visible:
-        text += f"\n\nJami: {fmt_price(total)}"
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Buyurtmani tasdiqlash", callback_data="confirm")],
-            [InlineKeyboardButton(text="⬅️ Bo'limlarga qaytish", callback_data="back")],
-        ]
-    )
-    await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "back")
-async def back_to_catalog(callback: CallbackQuery):
-    await callback.message.answer("Bo'limlar:", reply_markup=catalog_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "confirm")
-async def confirm_order(callback: CallbackQuery):
-    telegram_id = callback.from_user.id
-    cart = carts.get(telegram_id, {})
-    if not cart:
-        await callback.answer("Savat bo'sh")
-        return
-
-    user = get_user(telegram_id)
-    price_visible = bool(user["price_visible"])
-
-    lines = []
-    total = 0
-    for pid, qty in cart.items():
-        product = PRODUCTS_BY_ID[pid]
-        subtotal = calc_subtotal(product, qty)
-        total += subtotal
-        lines.append(f"{product['name']} — {qty} {product['unit']} — {fmt_price(subtotal)}")
-
-    items_text = "\n".join(lines)
-    save_order(telegram_id, items_text, total)
-
-    needs_file = any(PRODUCTS_BY_ID[pid]["category"] == PRINT_CATEGORY for pid in cart)
-    needs_details = any(PRODUCTS_BY_ID[pid]["category"] in CUSTOM_CATEGORIES for pid in cart)
-
-    await callback.message.answer("Buyurtmangiz qabul qilindi! ✅")
-
-    if needs_details:
-        await callback.message.answer(
-            "📝 Iltimos, quyidagi ma'lumotlarni bitta xabarda yozib yuboring:\n\n"
-            "1) Mavzu nomi\n"
-            "2) Til (o'zbek / rus / ingliz)\n"
-            "3) Muddat (qachongacha kerak)\n"
-            "4) Qo'shimcha talablar (agar bo'lsa)"
-        )
-        awaiting_details.add(telegram_id)
-
-    if needs_file:
-        if needs_details or not price_visible:
-            # Muddat allaqachon savolnomada so'raldi, yoki bu kelishilgan mijoz
-            # (kelishilgan mijozlar muddatni allaqachon shaxsan kelishib qo'yishadi)
-            await callback.message.answer(
-                "📎 Endi chop etish uchun kerakli faylingizni (PDF, Word va h.k.) shu yerga yuboring."
-            )
-            awaiting_file.add(telegram_id)
-        else:
-            # Faqat chop etish buyurtmasi va reklama mijozi — avval muddatni so'raymiz
-            await callback.message.answer(
-                "⏰ Qachonga zarur? Muddatni yozing (masalan: bugun soat 18:00 gacha, ertaga kunduzgacha):"
-            )
-            awaiting_deadline.add(telegram_id)
-
-    if not needs_file and not needs_details:
-        await callback.message.answer("Tez orada siz bilan bog'lanamiz.")
-
-    contact = f"@{user['username']}" if user["username"] else "username yo'q"
-    admin_text = (
-        "🆕 Yangi buyurtma!\n\n"
-        f"Mijoz: {user['name']} ({contact})\n"
-        f"Telegram ID: {telegram_id}\n"
-        f"Manba: {user['source']}\n\n"
-        f"{items_text}\n"
-    )
-    if price_visible:
-        admin_text += f"\nJami: {fmt_price(total)}"
-    else:
-        admin_text += "\n(Bu mijozga narx ko'rsatilmagan — narx kelishilgan)"
-
-    await bot.send_message(ADMIN_CHAT_ID, admin_text)
-    carts[telegram_id] = {}
-    await callback.answer()
+    # --- Boshqa barcha holatlarda: erkin xabar sifatida adminga yo'naltiramiz ---
+    await relay_to_admin(message)
 
 
 @router.message(F.document | F.photo)
 async def receive_file(message: Message):
     telegram_id = message.from_user.id
-    if telegram_id not in awaiting_file:
-        return  # kutilmagan fayl, e'tiborsiz qoldiramiz
 
-    user = get_user(telegram_id)
-    contact = f"@{user['username']}" if user["username"] else "username yo'q"
-    caption = f"📎 Fayl — {user['name']} ({contact}), ID: {telegram_id}"
+    if telegram_id in awaiting_file:
+        user = get_user(telegram_id)
+        contact = f"@{user['username']}" if user["username"] else "username yo'q"
+        caption = f"📎 Fayl — {user['name']} ({contact}), ID: {telegram_id}"
+        if message.document:
+            await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, caption=caption)
+        elif message.photo:
+            await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=caption)
+        awaiting_file.discard(telegram_id)
+        await message.answer("Fayl qabul qilindi ✅ Tez orada siz bilan bog'lanamiz.")
+        return
 
-    if message.document:
-        await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, caption=caption)
-    elif message.photo:
-        await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=caption)
+    # Kutilmagan fayl — erkin xabar sifatida adminga yo'naltiramiz
+    await relay_to_admin(message)
 
-    awaiting_file.discard(telegram_id)
-    await message.answer("Fayl qabul qilindi ✅ Tez orada siz bilan bog'lanamiz.")
+
+@router.message()
+async def relay_other(message: Message):
+    # Boshqa turdagi xabarlar (ovozli xabar, video va h.k.) uchun ham yo'naltirish
+    await relay_to_admin(message)
 
 
 # ---------- Webhook server (Render uchun) ----------
@@ -498,7 +529,6 @@ async def on_startup(app: web.Application):
 
 
 async def health(request: web.Request):
-    # UptimeRobot shu manzilga ping yuborib turadi, botni uxlab qolishdan saqlaydi
     return web.Response(text="OK")
 
 
