@@ -1,1 +1,42 @@
+name: Bot Sleep Schedule
 
+# Botlarni har kuni soat 08:00 (Toshkent vaqti) da yoqadi,
+# 20:00 da o'chiradi — Render'ning 750 soatlik oylik chegarasiga sig'ish uchun.
+#
+# 08:00 Toshkent = 03:00 UTC  ->  RESUME (yoqish)
+# 20:00 Toshkent = 15:00 UTC  ->  PAUSE  (o'chirish)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}   # GitHub sahifasidan qo'lda ham ishga tushirish mumkin
+
+jobs:
+  toggle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Qaysi amal bajarilishini aniqlash
+        id: decide
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 3 * * *" ]; then
+            echo "action=1" >> "$GITHUB_OUTPUT"   # 1 = resume (yoqish)
+            echo "label=YOQISH (08:00)" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=0" >> "$GITHUB_OUTPUT"   # 0 = pause (o'chirish)
+            echo "label=O'CHIRISH (20:00)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: UptimeRobot monitorlarini boshqarish
+        run: |
+          echo "Bajarilyapti: ${{ steps.decide.outputs.label }}"
+          IFS=',' read -ra IDS <<< "${{ vars.UPTIMEROBOT_MONITOR_IDS }}"
+          for ID in "${IDS[@]}"; do
+            echo "Monitor ID: $ID"
+            curl -s -X POST "https://api.uptimerobot.com/v2/editMonitor" \
+              --data-urlencode "api_key=${{ secrets.UPTIMEROBOT_API_KEY }}" \
+              --data-urlencode "id=$ID" \
+              --data-urlencode "status=${{ steps.decide.outputs.action }}" \
+              --data-urlencode "format=json"
+            echo ""
+          done
