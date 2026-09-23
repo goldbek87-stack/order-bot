@@ -6,7 +6,7 @@ name: Bot Sleep Schedule
 # 08:00 Toshkent = 03:00 UTC  ->  RESUME (yoqish)
 # 20:00 Toshkent = 15:00 UTC  ->  PAUSE  (o'chirish)
 
-on:
+"on":
   schedule:
     - cron: "0 3 * * *"
     - cron: "0 15 * * *"
